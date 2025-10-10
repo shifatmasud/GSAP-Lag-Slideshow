@@ -1,0 +1,5 @@
+{
+  "name": "GSAP Responsive Image Carousel",
+  "description": "A fully responsive, horizontal image carousel animated with the GSAP library to create a multi-stage transition: a recoil, an overshoot, and a final settle.",
+  "requestFramePermissions": []
+}
