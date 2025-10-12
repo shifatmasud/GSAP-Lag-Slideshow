@@ -1,4 +1,4 @@
-import React, { useState, useRef, useLayoutEffect } from 'react';
+import React, { useReducer, useRef, useLayoutEffect, useState, useEffect } from 'react';
 
 // TypeScript declarations for CDN libraries.
 declare const gsap: any;
@@ -22,49 +22,47 @@ const images: CarouselImage[] = [
 ];
 
 interface AnimationConfig {
-  mainEase: string;
-  mainOvershoot: number;
-  recoil: number;
-  cardOvershoot: number;
   stagger: number;
 }
 
 const defaultConfig: AnimationConfig = {
-  mainEase: 'back.inOut',
-  mainOvershoot: 1.7,
-  recoil: 80,
-  cardOvershoot: 2.5,
   stagger: 0.05,
 };
 
-const presets: Record<string, AnimationConfig> = {
-  'Default': { ...defaultConfig },
-  'Bouncy': { mainEase: 'elastic.out', mainOvershoot: 1.2, recoil: 120, cardOvershoot: 3, stagger: 0.03 },
-  'Smooth': { mainEase: 'power4.inOut', mainOvershoot: 1.7, recoil: 40, cardOvershoot: 1.5, stagger: 0.08 },
-  'Mechanical': { mainEase: 'power1.inOut', mainOvershoot: 1.7, recoil: 0, cardOvershoot: 1, stagger: 0.1 },
-};
-
-/**
- * Decoupled Animation Controller (Renderer Pattern)
- * This class handles all GSAP-related logic, completely separate from React's state and render cycle.
- * It is now stateless regarding the active index and calculates positioning dynamically.
- */
 class CarouselAnimation {
   private carouselEl: HTMLDivElement;
-  private cards: HTMLElement[];
+  public cards: HTMLElement[];
   private config: AnimationConfig;
+  public mainTween: any | null = null;
+  public cardsTimeline: any | null = null;
+
 
   constructor(carouselEl: HTMLDivElement, initialConfig: AnimationConfig) {
     this.carouselEl = carouselEl;
     this.cards = gsap.utils.toArray(this.carouselEl.children);
     this.config = initialConfig;
   }
+  
+  public getClosestIndex(): number {
+    if (!this.carouselEl) return 0;
+    const currentX = gsap.getProperty(this.carouselEl, 'x') as number;
+    let closestIndex = -1;
+    let minDistance = Infinity;
 
-  public init(startIndex: number) {
-    this.snapTo(startIndex);
+    for (let i = 0; i < this.cards.length; i++) {
+        const targetX = this.getTargetX(i);
+        const distance = Math.abs(currentX - targetX);
+        if (distance < minDistance) {
+            minDistance = distance;
+            closestIndex = i;
+        }
+    }
+    return closestIndex;
   }
 
   public destroy() {
+    this.mainTween?.kill();
+    this.cardsTimeline?.kill();
     gsap.killTweensOf([this.carouselEl, ...this.cards]);
   }
 
@@ -73,282 +71,324 @@ class CarouselAnimation {
   }
   
   private getTargetX(index: number): number {
-    if (index < 0 || index >= this.cards.length || !this.carouselEl.parentElement) {
-        return 0;
-    }
+    if (index < 0 || index >= this.cards.length || !this.carouselEl.parentElement) return 0;
     const parentWidth = this.carouselEl.parentElement.offsetWidth;
     const card = this.cards[index];
+    if (!card) return 0;
     const cardOffsetLeft = card.offsetLeft;
     const cardWidth = card.offsetWidth;
-
-    // Calculate the exact transform needed to center the card.
-    // The target is the parent's center minus the card's center relative to the carousel's start.
     return (parentWidth / 2) - cardOffsetLeft - (cardWidth / 2);
   }
 
-  public goTo(fromIndex: number, toIndex: number, onStart?: () => void, onComplete?: () => void) {
+  public drag(baseX: number, deltaX: number) {
+    if (!this.carouselEl) return;
+    gsap.set(this.carouselEl, { x: baseX + deltaX });
+  }
+
+  public goTo(fromIndex: number, toIndex: number, onComplete?: () => void) {
     if (toIndex < 0 || toIndex >= this.cards.length) return;
 
-    const targetX = this.getTargetX(toIndex);
-    const direction = toIndex > fromIndex ? 1 : (toIndex < fromIndex ? -1 : 0);
+    this.mainTween = gsap.to(this.carouselEl, {
+      x: this.getTargetX(toIndex),
+      duration: 1.5,
+      ease: 'power4.inOut',
+      overwrite: 'auto',
+      onComplete: onComplete,
+    });
 
-    gsap.killTweensOf([this.carouselEl, ...this.cards]);
-
-    const tl = gsap.timeline({ onStart, onComplete });
-
-    const mainEaseConfig = this.config.mainEase;
-    const mainTweenVars: any = {
-      x: targetX,
-      duration: 1.2,
-      ease: mainEaseConfig,
-    };
-
-    if (mainEaseConfig.includes('back')) {
-      mainTweenVars.overshoot = this.config.mainOvershoot;
-    } else if (mainEaseConfig.includes('elastic')) {
-      mainTweenVars.amplitude = this.config.mainOvershoot;
-    }
+    this.cardsTimeline?.kill();
     
-    tl.to(this.carouselEl, mainTweenVars, 0);
+    const cardTransformers = this.cards
+      .map(card => card.querySelector('.card-transformer') as HTMLElement)
+      .filter(Boolean);
 
-    if (direction !== 0) { // Only run recoil animation if slide is changing
-        this.cards.forEach((card, i) => {
-          const recoilAmount = this.config.recoil * direction;
-          const delay = Math.abs(i - fromIndex) * this.config.stagger;
-          
-          const cardTl = gsap.timeline();
-          
-          cardTl.to(card, {
-            x: -recoilAmount,
-            duration: 0.4,
-            ease: 'power2.out'
-          });
+    if (fromIndex !== toIndex) {
+        const pushAmount = 40; // The distance cards are pushed away.
 
-          cardTl.to(card, {
+        this.cardsTimeline = gsap.to(cardTransformers, {
+            keyframes: [
+                {
+                    // "Push away" from the target card
+                    x: (i) => {
+                        if (i < toIndex) return -pushAmount;
+                        if (i > toIndex) return pushAmount;
+                        return 0; // The target card is the source of the "push"
+                    },
+                    duration: 0.6,
+                    ease: 'power3.out'
+                },
+                {
+                    // "Settle" back to rest
+                    x: 0,
+                    duration: 1.0,
+                    ease: 'power4.out'
+                }
+            ],
+            stagger: {
+                each: this.config.stagger,
+                from: toIndex, // The effect radiates from the destination card
+                ease: 'power2.out',
+            },
+            overwrite: true,
+        });
+    } else {
+        // If snapping back to the same card, just animate back to rest.
+        this.cardsTimeline = gsap.to(cardTransformers, {
             x: 0,
-            duration: 1,
-            ease: 'back.out',
-            overshoot: this.config.cardOvershoot,
-          }, '>');
-
-          tl.add(cardTl, delay);
+            duration: 0.6,
+            ease: 'power3.out',
+            overwrite: true,
         });
     }
   }
 
   public snapTo(index: number) {
     if (!this.cards.length || index < 0 || index >= this.cards.length) return;
-    const targetX = this.getTargetX(index);
-    gsap.set(this.carouselEl, { x: targetX });
-    this.cards.forEach((card) => {
-      gsap.set(card, { x: 0 });
-    });
+    gsap.set(this.carouselEl, { x: this.getTargetX(index) });
+  }
+}
+
+// FSM State and Actions
+interface CarouselState {
+  currentIndex: number;
+  fromIndex: number;
+  status: 'idle' | 'animating';
+}
+
+type CarouselAction =
+  | { type: 'NEXT' }
+  | { type: 'PREV' }
+  | { type: 'GOTO'; payload: number }
+  | { type: 'ANIMATION_END' }
+  | { type: 'INTERRUPT'; payload: number };
+
+const initialCarouselState: CarouselState = {
+  currentIndex: 0,
+  fromIndex: 0,
+  status: 'idle',
+};
+
+function carouselReducer(state: CarouselState, action: CarouselAction): CarouselState {
+  switch (action.type) {
+    case 'NEXT': {
+      const nextIndex = (state.currentIndex + 1) % images.length;
+      return { ...state, status: 'animating', fromIndex: state.currentIndex, currentIndex: nextIndex };
+    }
+    case 'PREV': {
+      const prevIndex = (state.currentIndex - 1 + images.length) % images.length;
+      return { ...state, status: 'animating', fromIndex: state.currentIndex, currentIndex: prevIndex };
+    }
+    case 'GOTO': {
+      if (state.currentIndex === action.payload) return state;
+      return { ...state, status: 'animating', fromIndex: state.currentIndex, currentIndex: action.payload };
+    }
+    case 'INTERRUPT': {
+      const newIndex = action.payload;
+      return {
+        ...state,
+        status: 'idle',
+        currentIndex: newIndex,
+        fromIndex: newIndex,
+      };
+    }
+    case 'ANIMATION_END':
+      return {
+        ...state,
+        status: 'idle',
+        fromIndex: state.currentIndex,
+      };
+    default:
+      return state;
   }
 }
 
 const debounce = (func: (...args: any[]) => void, delay: number) => {
-  let timeoutId: number;
-  return (...args: any[]) => {
-    clearTimeout(timeoutId);
-    timeoutId = window.setTimeout(() => func(...args), delay);
+    let timeoutId: number;
+    return (...args: any[]) => {
+      clearTimeout(timeoutId);
+      timeoutId = window.setTimeout(() => func(...args), delay);
+    };
   };
-};
 
 const App: React.FC = () => {
-  const [activeIndex, setActiveIndex] = useState(Math.floor(images.length / 2));
-  const [isAnimating, setIsAnimating] = useState(false);
+  const [state, dispatch] = useReducer(carouselReducer, initialCarouselState);
+  const [displayedImage, setDisplayedImage] = useState<CarouselImage>(images[initialCarouselState.currentIndex]);
+  const [visibleBg, setVisibleBg] = useState(0);
+  
+  const currentIndexRef = useRef(state.currentIndex);
+  currentIndexRef.current = state.currentIndex;
+
   const animationController = useRef<CarouselAnimation | null>(null);
+  const masterTimelineRef = useRef<any>(null);
   const carouselRef = useRef<HTMLDivElement>(null);
+  const gestureWrapperRef = useRef<HTMLDivElement>(null);
+  const titleRef = useRef<HTMLHeadingElement>(null);
+  const authorRef = useRef<HTMLParagraphElement>(null);
+  const bgRef1 = useRef<HTMLDivElement>(null);
+  const bgRef2 = useRef<HTMLDivElement>(null);
+  const dragInfo = useRef({ isDragging: false, startX: 0, startCarouselX: 0, pointerId: null as number | null });
 
-  // Refs for swipe interaction
-  const isDraggingRef = useRef(false);
-  const startXRef = useRef(0);
-  const carouselStartPosRef = useRef(0);
-  const velocityTracker = useRef({ lastX: 0, lastTime: 0, velocity: 0 });
+  const handlePointerDown = (e: React.PointerEvent) => {
+    if (e.button !== 0) return;
 
-  const activeIndexRef = useRef(activeIndex);
-  activeIndexRef.current = activeIndex;
-
-  const handlePointerMove = (e: PointerEvent) => {
-    if (!isDraggingRef.current || !carouselRef.current) return;
-    e.preventDefault();
-
-    const currentX = e.pageX;
-    const deltaX = currentX - startXRef.current;
-    
-    const now = Date.now();
-    const dt = now - velocityTracker.current.lastTime;
-    if (dt > 0) {
-      const dx = currentX - velocityTracker.current.lastX;
-      velocityTracker.current.velocity = dx / dt;
+    if (state.status === 'animating') {
+        masterTimelineRef.current?.kill();
+        animationController.current?.destroy();
+        
+        const closestIndex = animationController.current!.getClosestIndex();
+        dispatch({ type: 'INTERRUPT', payload: closestIndex });
+        setDisplayedImage(images[closestIndex]);
     }
-    velocityTracker.current.lastX = currentX;
-    velocityTracker.current.lastTime = now;
-
-    gsap.set(carouselRef.current, { x: carouselStartPosRef.current + deltaX });
+    
+    dragInfo.current = {
+      isDragging: true,
+      startX: e.clientX,
+      startCarouselX: gsap.getProperty(carouselRef.current, 'x'),
+      pointerId: e.pointerId
+    };
+    
+    if (gestureWrapperRef.current) {
+      gestureWrapperRef.current.style.cursor = 'grabbing';
+      gestureWrapperRef.current.setPointerCapture(e.pointerId);
+    }
   };
 
-  const handlePointerUp = (e: PointerEvent) => {
-    if (!isDraggingRef.current) return;
-    isDraggingRef.current = false;
-    
-    window.removeEventListener('pointermove', handlePointerMove);
-    window.removeEventListener('pointerup', handlePointerUp);
+  const handlePointerMove = (e: React.PointerEvent) => {
+    if (!dragInfo.current.isDragging || e.pointerId !== dragInfo.current.pointerId) return;
+    const deltaX = e.clientX - dragInfo.current.startX;
+    animationController.current?.drag(dragInfo.current.startCarouselX, deltaX);
+  };
 
-    const cardWidth = carouselRef.current?.children[0]?.clientWidth ?? 0;
-    const currentX = gsap.getProperty(carouselRef.current, "x");
-    const deltaX = currentX - carouselStartPosRef.current;
-    
-    const velocity = velocityTracker.current.velocity;
-    const velocityThreshold = 0.3;
+  const handlePointerUp = (e: React.PointerEvent) => {
+    if (!dragInfo.current.isDragging || e.pointerId !== dragInfo.current.pointerId) return;
 
-    let newIndex = activeIndexRef.current;
+    if (gestureWrapperRef.current) {
+        gestureWrapperRef.current.style.cursor = 'grab';
+        gestureWrapperRef.current.releasePointerCapture(e.pointerId);
+    }
 
-    if (Math.abs(velocity) > velocityThreshold) {
-      newIndex = velocity < 0 ? newIndex + 1 : newIndex - 1;
+    const deltaX = e.clientX - dragInfo.current.startX;
+    const cardWidth = carouselRef.current?.querySelector('.carousel-card')?.offsetWidth ?? 300;
+    const threshold = cardWidth / 5; // More sensitive swipe
+
+    if (deltaX < -threshold) {
+        dispatch({ type: 'NEXT' });
+    } else if (deltaX > threshold) {
+        dispatch({ type: 'PREV' });
     } else {
-      if (Math.abs(deltaX) > cardWidth / 2) {
-        newIndex = deltaX < 0 ? newIndex + 1 : newIndex - 1;
-      }
+        animationController.current?.goTo(state.currentIndex, state.currentIndex);
     }
-
-    newIndex = Math.max(0, Math.min(images.length - 1, newIndex));
-    navigateTo(newIndex);
+    
+    dragInfo.current.isDragging = false;
   };
+
+  useLayoutEffect(() => {
+    if (state.status === 'animating' && animationController.current) {
+      masterTimelineRef.current?.kill();
+      
+      const masterTimeline = gsap.timeline({
+        onComplete: () => {
+          dispatch({ type: 'ANIMATION_END' });
+          setVisibleBg(prev => 1 - prev);
+          setDisplayedImage(images[state.currentIndex]);
+        }
+      });
+      masterTimelineRef.current = masterTimeline;
+
+      masterTimeline.to([titleRef.current, authorRef.current], {
+        y: '-100%', opacity: 0, duration: 0.5, ease: 'power3.in', stagger: 0.05,
+        overwrite: 'auto',
+      }, 0);
+      
+      const bgRefs = [bgRef1, bgRef2];
+      const newBgRef = bgRefs[1 - visibleBg].current;
+      const oldBgRef = bgRefs[visibleBg].current;
+      const newImage = images[state.currentIndex];
+  
+      if (newBgRef && newImage) {
+          newBgRef.style.backgroundImage = `url(${newImage.url})`;
+          masterTimeline.to(newBgRef, { opacity: 1, duration: 1.2, ease: 'power2.inOut', overwrite: 'auto' }, 0.1);
+      }
+      if (oldBgRef) {
+          masterTimeline.to(oldBgRef, { opacity: 0, duration: 1.2, ease: 'power2.inOut', overwrite: 'auto' }, 0.1);
+      }
+
+      animationController.current.goTo(state.fromIndex, state.currentIndex);
+    }
+  }, [state.status, state.currentIndex, state.fromIndex, visibleBg]);
+
+  useEffect(() => {
+    if (state.status !== 'animating') {
+      gsap.fromTo([titleRef.current, authorRef.current], 
+        { y: '100%', opacity: 0 }, 
+        {
+          y: '0%', opacity: 1, duration: 0.8, ease: 'power3.out', stagger: 0.1,
+          overwrite: 'auto',
+        }
+      );
+    }
+  }, [displayedImage, state.status]);
 
   useLayoutEffect(() => {
     if (!carouselRef.current) return;
 
     const controller = new CarouselAnimation(carouselRef.current, defaultConfig);
     animationController.current = controller;
-    controller.init(activeIndex);
-    
+    controller.snapTo(initialCarouselState.currentIndex);
+
+    if(bgRef1.current) {
+        bgRef1.current.style.backgroundImage = `url(${images[initialCarouselState.currentIndex].url})`;
+        gsap.set(bgRef1.current, { opacity: 1 });
+    }
+
     const gui = new lil.GUI();
-    const guiState = { ...defaultConfig, preset: 'Default' };
+    gui.add({ stagger: defaultConfig.stagger }, 'stagger', 0, 0.2, 0.01).name('Stagger').onChange((v:number) => controller.updateConfig({ stagger: v }));
     
-    const overshootController = gui.add(guiState, 'mainOvershoot', 0.1, 5, 0.1).name('Main Overshoot');
-    const mainEaseController = gui.add(guiState, 'mainEase', ['back.inOut', 'power4.inOut', 'elastic.out', 'bounce.out']).name('Main Ease');
-    const recoilController = gui.add(guiState, 'recoil', 0, 200, 1).name('Card Recoil');
-    const cardOvershootController = gui.add(guiState, 'cardOvershoot', 0.1, 5, 0.1).name('Card Overshoot');
-    const staggerController = gui.add(guiState, 'stagger', 0, 0.2, 0.01).name('Stagger');
-
-    const updateOvershootControl = (ease: string) => {
-      const isEnabled = ease.includes('back') || ease.includes('elastic');
-      overshootController.disable(!isEnabled);
-    };
-
-    const applyConfigToGui = (config: AnimationConfig) => {
-      Object.assign(guiState, config);
-      mainEaseController.setValue(guiState.mainEase);
-      overshootController.setValue(guiState.mainOvershoot);
-      recoilController.setValue(guiState.recoil);
-      cardOvershootController.setValue(guiState.cardOvershoot);
-      staggerController.setValue(guiState.stagger);
-      updateOvershootControl(config.mainEase);
-    };
-
-    const presetController = gui.add(guiState, 'preset', Object.keys(presets)).name('Preset')
-      .onChange((presetName: string) => {
-        const newConfig = presets[presetName];
-        controller.updateConfig(newConfig);
-        applyConfigToGui(newConfig);
-      });
-
-    const individualOnChange = (key: keyof AnimationConfig, value: any) => {
-        controller.updateConfig({ [key]: value });
-        presetController.setValue('Default');
-    };
-
-    overshootController.onChange((value: number) => individualOnChange('mainOvershoot', value));
-    mainEaseController.onChange((value: string) => {
-        individualOnChange('mainEase', value);
-        updateOvershootControl(value);
-    });
-    recoilController.onChange((value: number) => individualOnChange('recoil', value));
-    cardOvershootController.onChange((value: number) => individualOnChange('cardOvershoot', value));
-    staggerController.onChange((value: number) => individualOnChange('stagger', value));
-
-    gui.add({ reset: () => {
-        controller.updateConfig(defaultConfig);
-        applyConfigToGui(defaultConfig);
-        presetController.setValue('Default');
-    } }, 'reset').name('Reset Controls');
-
     const handleResize = debounce(() => {
-        animationController.current?.snapTo(activeIndexRef.current);
+        animationController.current?.snapTo(currentIndexRef.current);
     }, 200);
-
     window.addEventListener('resize', handleResize);
-
-    updateOvershootControl(defaultConfig.mainEase);
 
     return () => {
       controller.destroy();
       gui.destroy();
       window.removeEventListener('resize', handleResize);
-      window.removeEventListener('pointermove', handlePointerMove);
-      window.removeEventListener('pointerup', handlePointerUp);
     };
   }, []);
 
-  const navigateTo = (newIndex: number) => {
-    if (isAnimating || newIndex < 0 || newIndex >= images.length) return;
-    animationController.current?.goTo(
-      activeIndexRef.current,
-      newIndex,
-      () => setIsAnimating(true),
-      () => {
-        setActiveIndex(newIndex);
-        setIsAnimating(false);
-      }
-    );
-  };
-  
-  const handlePointerDown = (e: React.PointerEvent) => {
-    if (isAnimating) return;
-    isDraggingRef.current = true;
-    startXRef.current = e.pageX;
-    carouselStartPosRef.current = gsap.getProperty(carouselRef.current, "x");
-    velocityTracker.current = { lastX: e.pageX, lastTime: Date.now(), velocity: 0 };
-
-    window.addEventListener('pointermove', handlePointerMove);
-    window.addEventListener('pointerup', handlePointerUp);
-  };
-
   return (
     <div className="relative w-full h-screen flex flex-col items-center justify-center overflow-hidden antialiased text-white font-sans select-none">
-      <div 
-        className="w-full h-full absolute inset-0 bg-cover bg-center blur-xl scale-110" 
-        style={{ backgroundImage: `url(${images[activeIndex].url})`, transition: 'background-image 0.7s ease-in-out' }}
-      />
+      <div ref={bgRef1} className="w-full h-full absolute inset-0 bg-cover bg-center blur-xl scale-110"/>
+      <div ref={bgRef2} className="w-full h-full absolute inset-0 bg-cover bg-center blur-xl scale-110 opacity-0"/>
       <div className="absolute inset-0 bg-black/70" />
       
       <div className="relative w-full flex flex-col items-center justify-center z-10 space-y-8 py-8">
-        <div className="text-center transition-opacity duration-500 ease-in-out">
-          <h1 className="text-4xl md:text-5xl font-bold tracking-tight">{images[activeIndex].title}</h1>
-          <p className="text-lg md:text-xl text-gray-300 mt-2">by {images[activeIndex].author}</p>
+        <div className="text-center">
+            <div className="h-12 md:h-14 overflow-hidden">
+                <h1 ref={titleRef} className="text-4xl md:text-5xl font-bold tracking-tight">{displayedImage?.title}</h1>
+            </div>
+            <div className="h-7 md:h-8 overflow-hidden mt-2">
+                <p ref={authorRef} className="text-lg md:text-xl text-gray-300">by {displayedImage?.author}</p>
+            </div>
         </div>
 
         <div 
-            className="w-full relative h-[400px] md:h-[500px] lg:h-[600px] cursor-grab active:cursor-grabbing"
+            ref={gestureWrapperRef}
+            className="w-full relative h-[400px] md:h-[500px] lg:h-[600px]"
+            style={{ touchAction: 'pan-y', cursor: 'grab' }}
             onPointerDown={handlePointerDown}
-            style={{ touchAction: 'pan-y' }}
+            onPointerMove={handlePointerMove}
+            onPointerUp={handlePointerUp}
+            onPointerCancel={handlePointerUp}
+            onPointerLeave={handlePointerUp}
         >
-            <div
-                ref={carouselRef}
-                className="absolute top-0 left-0 h-full flex items-center"
-            >
-                {images.map((image) => (
-                    <div
-                        key={image.id}
-                        className="carousel-card flex-shrink-0 w-[70vw] md:w-[50vw] lg:w-[35vw] h-[80%] mx-8 relative pointer-events-none"
-                    >
-                        <div className="relative w-full h-full rounded-2xl overflow-hidden shadow-2xl">
-                            <img
-                                src={image.url}
-                                alt={image.title}
-                                className="w-full h-full object-cover"
-                            />
+            <div ref={carouselRef} className="absolute top-0 left-0 h-full flex items-center">
+                {images.map((image, index) => (
+                    <div key={`${image.id}-${index}`} className="carousel-card flex-shrink-0 w-[70vw] md:w-[50vw] lg:w-[35vw] h-[80%] mx-8 relative pointer-events-none">
+                        <div className="card-transformer w-full h-full">
+                            <div className="relative w-full h-full rounded-2xl overflow-hidden shadow-2xl">
+                                <img src={image.url} alt={image.title} className="w-full h-full object-cover"/>
+                            </div>
                         </div>
                     </div>
                 ))}
@@ -358,17 +398,15 @@ const App: React.FC = () => {
         <div className="flex flex-col items-center space-y-4">
           <div className="flex items-center space-x-4">
             <button
-              onClick={() => navigateTo(activeIndex - 1)}
-              disabled={isAnimating || activeIndex === 0}
-              className="group p-3 rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+              onClick={() => dispatch({type: 'PREV'})}
+              className="group p-3 rounded-full bg-white/10 transition-all enabled:hover:bg-white/20"
               aria-label="Previous slide"
             >
                 <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 transition-transform duration-300 ease-in-out group-hover:-translate-x-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" /></svg>
             </button>
             <button
-              onClick={() => navigateTo(activeIndex + 1)}
-              disabled={isAnimating || activeIndex === images.length - 1}
-              className="group p-3 rounded-full bg-white/10 hover:bg-white/20 disabled:opacity-30 disabled:cursor-not-allowed transition-all"
+              onClick={() => dispatch({type: 'NEXT'})}
+              className="group p-3 rounded-full bg-white/10 transition-all enabled:hover:bg-white/20"
               aria-label="Next slide"
             >
               <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6 transition-transform duration-300 ease-in-out group-hover:translate-x-1" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" /></svg>
@@ -378,11 +416,8 @@ const App: React.FC = () => {
             {images.map((_, index) => (
               <button
                 key={index}
-                onClick={() => navigateTo(index)}
-                disabled={isAnimating}
-                className={`w-3 h-3 rounded-full transition-all duration-300 ${
-                  activeIndex === index ? 'bg-white scale-125' : 'bg-white/40 hover:bg-white/60'
-                } disabled:cursor-not-allowed`}
+                onClick={() => dispatch({type: 'GOTO', payload: index })}
+                className={`w-3 h-3 rounded-full transition-all duration-300 ${ state.currentIndex === index ? 'bg-white scale-125' : 'bg-white/40 hover:bg-white/60' }`}
                 aria-label={`Go to slide ${index + 1}`}
               />
             ))}
