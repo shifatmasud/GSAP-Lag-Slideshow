@@ -23,14 +23,20 @@ const images: CarouselImage[] = [
 
 interface AnimationConfig {
   stagger: number;
+  layout: 'linear' | 'arc';
+  arcStrength: number;
+  arcRotation: number;
 }
 
 const defaultConfig: AnimationConfig = {
   stagger: 0.05,
+  layout: 'linear',
+  arcStrength: 300,
+  arcRotation: 20,
 };
 
 class CarouselAnimation {
-  private carouselEl: HTMLDivElement;
+  public carouselEl: HTMLDivElement | null; // Public for external access if needed, but safer typing here
   public cards: HTMLElement[];
   private config: AnimationConfig;
   public mainTween: any | null = null;
@@ -41,6 +47,9 @@ class CarouselAnimation {
     this.carouselEl = carouselEl;
     this.cards = gsap.utils.toArray(this.carouselEl.children);
     this.config = initialConfig;
+    
+    // Add render loop for layout transformations
+    gsap.ticker.add(this.render);
   }
   
   public getClosestIndex(): number {
@@ -61,9 +70,12 @@ class CarouselAnimation {
   }
 
   public destroy() {
+    gsap.ticker.remove(this.render);
     this.mainTween?.kill();
     this.cardsTimeline?.kill();
-    gsap.killTweensOf([this.carouselEl, ...this.cards]);
+    if (this.carouselEl) {
+        gsap.killTweensOf([this.carouselEl, ...this.cards]);
+    }
   }
 
   public updateConfig(newConfig: Partial<AnimationConfig>) {
@@ -71,7 +83,7 @@ class CarouselAnimation {
   }
   
   private getTargetX(index: number): number {
-    if (index < 0 || index >= this.cards.length || !this.carouselEl.parentElement) return 0;
+    if (!this.carouselEl || index < 0 || index >= this.cards.length || !this.carouselEl.parentElement) return 0;
     const parentWidth = this.carouselEl.parentElement.offsetWidth;
     const card = this.cards[index];
     if (!card) return 0;
@@ -109,7 +121,7 @@ class CarouselAnimation {
             keyframes: [
                 {
                     // "Push away" from the target card
-                    x: (i) => {
+                    x: (i: number) => {
                         if (i < toIndex) return -pushAmount;
                         if (i > toIndex) return pushAmount;
                         return 0; // The target card is the source of the "push"
@@ -145,6 +157,57 @@ class CarouselAnimation {
   public snapTo(index: number) {
     if (!this.cards.length || index < 0 || index >= this.cards.length) return;
     gsap.set(this.carouselEl, { x: this.getTargetX(index) });
+  }
+
+  // Loop to apply arc layout transforms
+  private render = () => {
+    if (!this.carouselEl || !this.carouselEl.parentElement) return;
+
+    const isArc = this.config.layout === 'arc';
+    const currentX = gsap.getProperty(this.carouselEl, 'x') as number;
+    const viewportWidth = window.innerWidth;
+    const viewportCenter = viewportWidth / 2;
+    
+    this.cards.forEach((card) => {
+        // If linear, we must ensure transforms are reset
+        if (!isArc) {
+            // Check properties to avoid unnecessary writes, or just overwrite for simplicity/robustness
+            gsap.set(card, { 
+                y: 0, 
+                rotation: 0, 
+                scale: 1, 
+                transformOrigin: '50% 50%',
+                overwrite: 'auto' 
+            });
+            return;
+        }
+
+        const cardX = currentX + card.offsetLeft;
+        const cardWidth = card.offsetWidth;
+        const cardCenter = cardX + cardWidth / 2;
+        const dist = cardCenter - viewportCenter;
+        
+        // Normalize distance: 0 at center, +/- 1 at screen edges
+        const norm = dist / viewportWidth;
+        
+        // Calculate curve
+        // Y goes positive (down) as we move away from center -> Hill shape
+        const y = Math.pow(Math.abs(norm), 2) * this.config.arcStrength;
+        
+        // Rotation
+        const rot = norm * this.config.arcRotation;
+        
+        // Scale
+        const scale = 1 - Math.abs(norm) * 0.15;
+
+        gsap.set(card, {
+            y: y,
+            rotation: rot,
+            scale: scale,
+            transformOrigin: '50% 100%', // Pivot from bottom for arc effect
+            overwrite: 'auto'
+        });
+    });
   }
 }
 
@@ -233,7 +296,14 @@ const App: React.FC = () => {
 
     if (state.status === 'animating') {
         masterTimelineRef.current?.kill();
-        animationController.current?.destroy();
+        
+        // Don't call destroy() here because it removes the GSAP ticker needed for Arc layout.
+        // Instead, kill only the movement tweens.
+        animationController.current?.mainTween?.kill();
+        animationController.current?.cardsTimeline?.kill();
+        if (animationController.current?.carouselEl) {
+             gsap.killTweensOf(animationController.current.carouselEl);
+        }
         
         const closestIndex = animationController.current!.getClosestIndex();
         dispatch({ type: 'INTERRUPT', payload: closestIndex });
@@ -344,6 +414,14 @@ const App: React.FC = () => {
     const gui = new lil.GUI();
     gui.add({ stagger: defaultConfig.stagger }, 'stagger', 0, 0.2, 0.01).name('Stagger').onChange((v:number) => controller.updateConfig({ stagger: v }));
     
+    // Add Arc / Layout controls
+    const layoutParams = { layout: defaultConfig.layout };
+    gui.add(layoutParams, 'layout', ['linear', 'arc']).name('Layout Mode').onChange((v: 'linear'|'arc') => controller.updateConfig({ layout: v }));
+    
+    const folder = gui.addFolder('Arc Settings');
+    folder.add({ strength: defaultConfig.arcStrength }, 'strength', 0, 600).name('Curve Height').onChange((v:number) => controller.updateConfig({ arcStrength: v }));
+    folder.add({ rotation: defaultConfig.arcRotation }, 'rotation', 0, 90).name('Max Rotation').onChange((v:number) => controller.updateConfig({ arcRotation: v }));
+    
     const handleResize = debounce(() => {
         animationController.current?.snapTo(currentIndexRef.current);
     }, 200);
@@ -384,7 +462,7 @@ const App: React.FC = () => {
         >
             <div ref={carouselRef} className="absolute top-0 left-0 h-full flex items-center">
                 {images.map((image, index) => (
-                    <div key={`${image.id}-${index}`} className="carousel-card flex-shrink-0 w-[70vw] md:w-[50vw] lg:w-[35vw] h-[80%] mx-8 relative pointer-events-none">
+                    <div key={`${image.id}-${index}`} className="carousel-card flex-shrink-0 w-[70vw] md:w-[50vw] lg:w-[35vw] h-[80%] mx-8 relative pointer-events-none origin-bottom">
                         <div className="card-transformer w-full h-full">
                             <div className="relative w-full h-full rounded-2xl overflow-hidden shadow-2xl">
                                 <img src={image.url} alt={image.title} className="w-full h-full object-cover"/>
